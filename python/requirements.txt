@@ -1,0 +1,8 @@
+funasr
+torch
+numpy
+soundfile
+onnxruntime
+safetensors
+ml-dtypes
+PyYAML
