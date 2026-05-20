@@ -12,9 +12,7 @@ import torch
 
 from utils import (
     ADAPTOR_AXMODEL,
-    ADAPTOR_ONNX,
     ENCODER_AXMODEL,
-    ENCODER_ONNX,
     LLM_AXMODEL_DIR,
     LLM_EMBED_NPY,
     LLM_POST_AXMODEL,
@@ -23,6 +21,10 @@ from utils import (
     ensure_source_repo_on_path,
     resolve_source_repo,
 )
+
+
+AUDIO_ENCODER_FRAMES = 94
+
 
 try:
     from ml_dtypes import bfloat16
@@ -267,16 +269,8 @@ def parse_args():
         "Defaults to $FUN_ASR_SOURCE_REPO, ../Fun-ASR, then ./Fun-ASR.",
     )
     parser.add_argument("--wav-path", default="", help="Input wav file. Defaults to model_dir/example/zh.mp3.")
-    parser.add_argument("--encoder-onnx", default=str(ENCODER_ONNX), help="audio_encoder ONNX path.")
-    parser.add_argument("--adaptor-onnx", default=str(ADAPTOR_ONNX), help="audio_adaptor ONNX path.")
     parser.add_argument("--encoder-axmodel", default=str(ENCODER_AXMODEL), help="audio_encoder axmodel path.")
     parser.add_argument("--adaptor-axmodel", default=str(ADAPTOR_AXMODEL), help="audio_adaptor axmodel path.")
-    parser.add_argument(
-        "--frontend-backend",
-        choices=["auto", "axmodel", "onnx"],
-        default="auto",
-        help="Execution backend for audio_encoder/audio_adaptor. auto prefers axmodel when available.",
-    )
     parser.add_argument("--device", choices=["cpu", "cuda"], default="cpu", help="PyTorch device for preprocessing only.")
     parser.add_argument("--language", default=None, help="Optional target language.")
     parser.add_argument("--itn", action="store_true", help="Enable text normalization.")
@@ -394,29 +388,6 @@ def build_batch(model, kwargs, wav_path: Path, device: str, source_repo: str = "
     return batch, tokenizer, contents
 
 
-def run_audio_onnx(encoder_onnx: Path, adaptor_onnx: Path, speech: torch.Tensor, speech_lengths: torch.Tensor):
-    import onnxruntime as ort
-
-    encoder_sess = ort.InferenceSession(str(encoder_onnx), providers=["CPUExecutionProvider"])
-    adaptor_sess = ort.InferenceSession(str(adaptor_onnx), providers=["CPUExecutionProvider"])
-
-    speech_np = speech.detach().cpu().numpy().astype(np.float32)
-    speech_lengths_np = speech_lengths.detach().cpu().numpy().astype(np.int32)
-
-    encoder_out, encoder_out_lens = encoder_sess.run(
-        None,
-        {"speech": speech_np, "speech_lengths": speech_lengths_np},
-    )
-    adaptor_out, adaptor_out_lens = adaptor_sess.run(
-        None,
-        {
-            "audio_encoder_out": encoder_out.astype(np.float32),
-            "audio_encoder_out_lens": encoder_out_lens.astype(np.int32),
-        },
-    )
-    return adaptor_out, adaptor_out_lens
-
-
 def get_ax_inference_session():
     try:
         from axengine import InferenceSession
@@ -456,37 +427,49 @@ def get_ax_inference_session():
     return InferenceSession
 
 
-def run_audio_axmodel(encoder_axmodel: Path, adaptor_axmodel: Path, speech: torch.Tensor, speech_lengths: torch.Tensor):
+def load_audio_sessions(encoder_axmodel: Path, adaptor_axmodel: Path):
     InferenceSession = get_ax_inference_session()
+    return InferenceSession(str(encoder_axmodel)), InferenceSession(str(adaptor_axmodel))
 
-    encoder_sess = InferenceSession(str(encoder_axmodel))
-    adaptor_sess = InferenceSession(str(adaptor_axmodel))
 
+def run_audio_axmodel(encoder_sess, adaptor_sess, speech: torch.Tensor, speech_lengths: torch.Tensor):
     speech_np = speech.detach().cpu().numpy().astype(np.float32)
     speech_lengths_np = speech_lengths.detach().cpu().numpy().astype(np.int32)
+    if speech_np.ndim != 3 or speech_np.shape[0] != 1:
+        raise ValueError(f"Only batch size 1 speech input is supported, got shape {speech_np.shape}.")
 
-    encoder_out, encoder_out_lens = encoder_sess.run(
-        None,
-        {"speech": speech_np, "speech_lengths": speech_lengths_np},
-    )
-    adaptor_out, adaptor_out_lens = adaptor_sess.run(
-        None,
-        {
-            "audio_encoder_out": encoder_out.astype(np.float32),
-            "audio_encoder_out_lens": encoder_out_lens.astype(np.int32),
-        },
-    )
-    return adaptor_out, adaptor_out_lens
+    total_frames = int(speech_lengths_np.reshape(-1)[0])
+    if total_frames <= 0:
+        total_frames = int(speech_np.shape[1])
 
+    adaptor_chunks = []
+    adaptor_lens = []
+    feature_dim = speech_np.shape[2]
+    for start in range(0, total_frames, AUDIO_ENCODER_FRAMES):
+        end = min(start + AUDIO_ENCODER_FRAMES, total_frames)
+        chunk_len = end - start
+        speech_chunk = np.zeros((1, AUDIO_ENCODER_FRAMES, feature_dim), dtype=np.float32)
+        speech_chunk[:, :chunk_len, :] = speech_np[:, start:end, :]
+        speech_chunk_lens = np.array([chunk_len], dtype=np.int32)
 
-def select_frontend_backend(args):
-    if args.frontend_backend == "axmodel":
-        return "axmodel"
-    if args.frontend_backend == "onnx":
-        return "onnx"
-    if Path(args.encoder_axmodel).exists() and Path(args.adaptor_axmodel).exists():
-        return "axmodel"
-    return "onnx"
+        encoder_out, encoder_out_lens = encoder_sess.run(
+            None,
+            {"speech": speech_chunk, "speech_lengths": speech_chunk_lens},
+        )
+        adaptor_out, adaptor_out_lens = adaptor_sess.run(
+            None,
+            {
+                "audio_encoder_out": encoder_out.astype(np.float32),
+                "audio_encoder_out_lens": encoder_out_lens.astype(np.int32),
+            },
+        )
+        valid_len = int(adaptor_out_lens.reshape(-1)[0])
+        adaptor_chunks.append(adaptor_out[:, :valid_len, :])
+        adaptor_lens.append(valid_len)
+
+    if not adaptor_chunks:
+        raise ValueError("No audio chunks were produced for axmodel inference.")
+    return np.concatenate(adaptor_chunks, axis=1), np.array([sum(adaptor_lens)], dtype=np.int32)
 
 
 def ensure_embed_npy(embed_npy: Path, llm_source_dir: Path):
@@ -539,10 +522,9 @@ def ensure_embed_npy(embed_npy: Path, llm_source_dir: Path):
     raise FileNotFoundError(f"Could not extract embedding weights from: {llm_source_dir}")
 
 
-def build_inputs_embeds(batch, source_ids: torch.Tensor, embed_npy: Path, adaptor_out: np.ndarray, adaptor_out_lens: np.ndarray):
+def build_inputs_embeds(batch, source_ids: torch.Tensor, embeds: np.ndarray, adaptor_out: np.ndarray, adaptor_out_lens: np.ndarray):
     input_ids = source_ids.clone()
     input_ids[input_ids < 0] = 0
-    embeds = np.load(embed_npy)
     inputs_embeds = np.take(embeds, input_ids.detach().cpu().numpy(), axis=0).astype(np.float32)
     adaptor_out_lens_t = torch.from_numpy(adaptor_out_lens)
 
@@ -586,6 +568,28 @@ def sample_next_token(logits: np.ndarray, temperature: float):
     return int(np.random.choice(len(probs), p=probs))
 
 
+def get_audio_duration_seconds(wav_path: Path) -> float:
+    try:
+        import soundfile as sf
+
+        info = sf.info(str(wav_path))
+        if info.frames > 0 and info.samplerate > 0:
+            return float(info.frames) / float(info.samplerate)
+    except Exception:
+        pass
+
+    try:
+        import torchaudio
+
+        info = torchaudio.info(str(wav_path))
+        if info.num_frames > 0 and info.sample_rate > 0:
+            return float(info.num_frames) / float(info.sample_rate)
+    except Exception:
+        pass
+
+    return 0.0
+
+
 def load_llm_sessions(llm_dir: Path, post_axmodel: Path, num_hidden_layers: int, prefill_len: int):
     InferenceSession = get_ax_inference_session()
     decoder_sessions = []
@@ -597,18 +601,17 @@ def load_llm_sessions(llm_dir: Path, post_axmodel: Path, num_hidden_layers: int,
 
 def run_llm_axmodel(
     tokenizer,
-    llm_dir: Path,
-    llm_source_dir: Path,
-    llm_post_axmodel: Path,
     inputs_embeds: np.ndarray,
-    embed_npy: Path,
+    embeds: np.ndarray,
+    cfg: dict,
+    decoder_sessions,
+    post_session,
     max_length: int,
     prefill_len: int,
     max_prefill_tokens: int,
     kv_cache_len: int,
     temperature: float,
 ):
-    cfg = load_llm_config(llm_source_dir)
     num_hidden_layers = cfg["num_hidden_layers"]
     hidden_size = cfg["hidden_size"]
     num_attention_heads = cfg["num_attention_heads"]
@@ -616,10 +619,6 @@ def run_llm_axmodel(
     head_dim = cfg.get("head_dim") or hidden_size // num_attention_heads
     eos_token_id = cfg.get("eos_token_id", getattr(tokenizer, "eos_token_id", None))
     kv_dim = head_dim * num_key_value_heads
-
-    decoder_sessions, post_session = load_llm_sessions(
-        llm_dir, llm_post_axmodel, num_hidden_layers, prefill_len
-    )
 
     token_len = inputs_embeds.shape[1]
     if token_len > max_prefill_tokens:
@@ -675,7 +674,6 @@ def run_llm_axmodel(
     mask_decode = np.zeros((1, 1, kv_cache_len + 1), dtype=np.float32).astype(bfloat16)
     mask_decode[:, :, :kv_cache_len] -= 65536
     mask_decode[:, :, :token_len] = 0
-    embeds = np.load(embed_npy)
 
     for _ in range(max_length):
         generated_tokens.append(next_token)
@@ -714,15 +712,12 @@ def run_llm_axmodel(
 def main():
     args = parse_args()
     model_dir = Path(args.model_dir).resolve()
-    encoder_onnx = Path(args.encoder_onnx).resolve()
-    adaptor_onnx = Path(args.adaptor_onnx).resolve()
     encoder_axmodel = Path(args.encoder_axmodel).resolve()
     adaptor_axmodel = Path(args.adaptor_axmodel).resolve()
     llm_dir = Path(args.llm_dir).resolve()
     llm_source_dir = Path(args.llm_source_dir).resolve()
     llm_embed_npy = Path(args.llm_embed_npy).resolve()
     llm_post_axmodel = Path(args.llm_post_axmodel).resolve()
-    frontend_backend = select_frontend_backend(args)
 
     if not model_dir.exists():
         raise FileNotFoundError(f"Model directory not found: {model_dir}")
@@ -739,19 +734,14 @@ def main():
         raise FileNotFoundError(f"LLM source directory not found: {llm_source_dir}")
     if not llm_post_axmodel.exists():
         raise FileNotFoundError(f"LLM post axmodel not found: {llm_post_axmodel}")
-    if frontend_backend == "onnx":
-        if not encoder_onnx.exists():
-            raise FileNotFoundError(f"Encoder ONNX not found: {encoder_onnx}")
-        if not adaptor_onnx.exists():
-            raise FileNotFoundError(f"Adaptor ONNX not found: {adaptor_onnx}")
-    else:
-        if not encoder_axmodel.exists():
-            raise FileNotFoundError(f"Encoder axmodel not found: {encoder_axmodel}")
-        if not adaptor_axmodel.exists():
-            raise FileNotFoundError(f"Adaptor axmodel not found: {adaptor_axmodel}")
+    if not encoder_axmodel.exists():
+        raise FileNotFoundError(f"Encoder axmodel not found: {encoder_axmodel}")
+    if not adaptor_axmodel.exists():
+        raise FileNotFoundError(f"Adaptor axmodel not found: {adaptor_axmodel}")
     if args.device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is not available.")
 
+    # Keep all model/session initialization outside the measured inference window.
     model, kwargs = load_model(
         model_dir,
         args.device,
@@ -765,34 +755,52 @@ def main():
     if not wav_path.exists():
         raise FileNotFoundError(f"Wav path not found: {wav_path}")
 
+    encoder_sess, adaptor_sess = load_audio_sessions(encoder_axmodel, adaptor_axmodel)
+    ensure_embed_npy(llm_embed_npy, llm_source_dir)
+    embeds = np.load(llm_embed_npy)
+    llm_cfg = load_llm_config(llm_source_dir)
+    decoder_sessions, post_session = load_llm_sessions(
+        llm_dir,
+        llm_post_axmodel,
+        llm_cfg["num_hidden_layers"],
+        args.llm_prefill_len,
+    )
+
+    infer_start = time.perf_counter()
     batch, tokenizer, _contents = build_batch(model, kwargs, wav_path, args.device, str(resolved_source_repo))
     speech = batch["speech"]
     if len(speech) == 0:
         raise ValueError(f"No speech features were extracted from wav: {wav_path}")
     speech_lengths = batch["speech_lengths"][:, 0]
 
-    if frontend_backend == "axmodel":
-        adaptor_out, adaptor_out_lens = run_audio_axmodel(encoder_axmodel, adaptor_axmodel, speech, speech_lengths)
-    else:
-        adaptor_out, adaptor_out_lens = run_audio_onnx(encoder_onnx, adaptor_onnx, speech, speech_lengths)
-    ensure_embed_npy(llm_embed_npy, llm_source_dir)
+    adaptor_out, adaptor_out_lens = run_audio_axmodel(encoder_sess, adaptor_sess, speech, speech_lengths)
     source_ids = batch["source_ids"].clone()
-    inputs_embeds = build_inputs_embeds(batch, source_ids, llm_embed_npy, adaptor_out, adaptor_out_lens)
+    inputs_embeds = build_inputs_embeds(batch, source_ids, embeds, adaptor_out, adaptor_out_lens)
     text = run_llm_axmodel(
         tokenizer=tokenizer,
-        llm_dir=llm_dir,
-        llm_source_dir=llm_source_dir,
-        llm_post_axmodel=llm_post_axmodel,
         inputs_embeds=inputs_embeds,
-        embed_npy=llm_embed_npy,
+        embeds=embeds,
+        cfg=llm_cfg,
+        decoder_sessions=decoder_sessions,
+        post_session=post_session,
         max_length=args.max_length,
         prefill_len=args.llm_prefill_len,
         max_prefill_tokens=args.llm_max_prefill_tokens,
         kv_cache_len=args.llm_kv_cache_len,
         temperature=args.temperature,
     )
+    infer_time = time.perf_counter() - infer_start
+    audio_duration = get_audio_duration_seconds(wav_path)
+    rtf = infer_time / audio_duration if audio_duration > 0 else 0.0
 
     print(text)
+    print(f"[INFO] inference_time: {infer_time:.3f}s")
+    if audio_duration > 0:
+        print(f"[INFO] audio_duration: {audio_duration:.3f}s")
+        print(f"[INFO] rtf: {rtf:.4f}")
+    else:
+        print("[INFO] audio_duration: unavailable")
+        print("[INFO] rtf: unavailable")
 
 
 if __name__ == "__main__":

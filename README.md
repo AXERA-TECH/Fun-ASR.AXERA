@@ -268,17 +268,34 @@ model_convert/quant/build-audio-encoder/
 model_convert/quant/build-audio-adaptor/
 model_convert/quant/Qwen3-0.6B-LLM-Build/config.json
 model_convert/quant/Qwen3-0.6B-LLM-Build--AX650-C128_P1024_CTX2047/
+model_repo/
 ```
 其中 `Qwen3-0.6B-LLM-Build/config.json` 提供 LLM 结构参数，不需要拷贝完整的 `Qwen3-0.6B-LLM-Build/` 权重目录。
 
+`model_repo/` 不用拷贝 `model.pt` 这个大文件，推理只需要配置、tokenizer 和测试音频：
 
-推理前 `python/` 目录中至少应包含：
+
+推理前 `python/` 目录中包含：
 
 ```text
 python/
 ├── infer_asr.py
 ├── requirements.txt
 ├── utils.py
+├── model_repo/
+│   ├── config.yaml
+│   ├── configuration.json
+│   ├── multilingual.tiktoken
+│   ├── example/
+│   │   ├── en.mp3
+│   │   └── zh.mp3
+│   └── Qwen3-0.6B/
+│       ├── config.json
+│       ├── generation_config.json
+│       ├── merges.txt
+│       ├── tokenizer.json
+│       ├── tokenizer_config.json
+│       └── vocab.json
 ├── build-audio-encoder/
 │   └── fun_asr_audio_encoder.axmodel
 ├── build-audio-adaptor/
@@ -308,7 +325,33 @@ pip install axengine-x.x.x-py3-none-any.whl
 ### 推理：
 ```bash
 python3 infer_asr.py \
-  --wav-path ../model_repo/example/zh.mp3
+  --wav-path model_repo/example/zh.mp3
 ```
 
-如果测试音频不在 `../model_repo/example/zh.mp3`，将 `--wav-path` 改成板端实际音频路径。
+如果测试音频不在 `model_repo/example/zh.mp3`，将 `--wav-path` 改成板端实际音频路径。
+
+英文音频参考输出：
+
+```bash
+python3 infer_asr.py --wav-path model_repo/example/en.mp3
+```
+
+```text
+The tribal chieftain called for the boy and presented him with fifty pieces of gold
+[INFO] inference_time: 3.618s
+[INFO] audio_duration: 7.180s
+[INFO] rtf: 0.5039
+```
+
+中文音频参考输出：
+
+```bash
+python3 infer_asr.py --wav-path model_repo/example/zh.mp3
+```
+
+```text
+開放時間早上九點至下午五點
+[INFO] inference_time: 2.231s
+[INFO] audio_duration: 5.622s
+[INFO] rtf: 0.3968
+```

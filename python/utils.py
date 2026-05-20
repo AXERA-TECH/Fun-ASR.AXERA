@@ -10,10 +10,8 @@ SOURCE_REPO_CANDIDATES = (
     str(REPO_ROOT / "Fun-ASR"),
     str(REPO_ROOT.parent / "Fun-ASR"),
 )
-MODEL_REPO = REPO_ROOT / "model_repo"
+MODEL_REPO = PYTHON_DIR / "model_repo"
 MODEL_CONVERT_DIR = REPO_ROOT / "model_convert"
-ENCODER_ONNX = MODEL_CONVERT_DIR / "fun_asr_audio_encoder.onnx"
-ADAPTOR_ONNX = MODEL_CONVERT_DIR / "fun_asr_audio_adaptor.onnx"
 ENCODER_AXMODEL = PYTHON_DIR / "build-audio-encoder" / "fun_asr_audio_encoder.axmodel"
 ADAPTOR_AXMODEL = PYTHON_DIR / "build-audio-adaptor" / "fun_asr_audio_adaptor.axmodel"
 LLM_SOURCE_DIR = PYTHON_DIR / "Qwen3-0.6B-LLM-Build"
@@ -56,8 +54,6 @@ def describe_paths():
         "source_repo": str(source_repo),
         "model_repo": str(MODEL_REPO),
         "model_convert_dir": str(MODEL_CONVERT_DIR),
-        "encoder_onnx": str(ENCODER_ONNX),
-        "adaptor_onnx": str(ADAPTOR_ONNX),
         "encoder_axmodel": str(ENCODER_AXMODEL),
         "adaptor_axmodel": str(ADAPTOR_AXMODEL),
         "llm_source_dir": str(LLM_SOURCE_DIR),
